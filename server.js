@@ -242,8 +242,24 @@ wss.on('connection', ws => {
         started: room.started,
         players: getPlayers(room),
         worldState: room.worldState,
-        chipClaimed: room.chipClaimed
+        chipClaimed: room.chipClaimed,
+        playerStates: Object.fromEntries(room.playerStates)
       });
+
+      // ENVIAR ESTADOS DOS JOGADORES EXISTENTES
+      for (const [peerId, peerState] of room.playerStates) {
+        if (peerId === player.id) continue;
+
+        const peer = Array.from(room.players.values())
+          .find(p => p.id === peerId);
+
+        send(ws, {
+          type: 'peer_state',
+          playerId: peerId,
+          name: peer ? peer.name : 'Jogador',
+          state: peerState
+        });
+      }
 
       broadcast(room, {
         type: 'player_joined',
@@ -355,17 +371,20 @@ wss.on('connection', ws => {
     }
 
     // EVENTOS DE CHEFES E INIMIGOS
+    // TODOS OS JOGADORES PODEM ENVIAR EVENTOS.
     if (msg.type === 'world_event') {
-      if (!isHost) {
-        sendError(ws, 'Somente o host pode enviar eventos do mundo.');
-        return;
-      }
-
       if (
         !msg.event ||
         typeof msg.event !== 'object' ||
         Array.isArray(msg.event)
       ) return;
+
+      const serialized = JSON.stringify(msg.event);
+
+      if (Buffer.byteLength(serialized, 'utf8') > 16 * 1024) {
+        sendError(ws, 'Evento do mundo muito grande.');
+        return;
+      }
 
       broadcast(room, {
         type: 'world_event',
@@ -472,5 +491,7 @@ wss.on('connection', ws => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('Undead Historic multiplayer online na porta ' + PORT);
+  console.log(
+    'Undead Historic multiplayer online na porta ' + PORT
+  );
 });
