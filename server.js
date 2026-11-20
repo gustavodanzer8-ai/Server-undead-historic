@@ -6,39 +6,41 @@ const { WebSocketServer, WebSocket } = require('ws');
 
 const PORT = Number(process.env.PORT || 10000);
 const MAX_PLAYERS = 4;
-const MAX_NAME_LENGTH = 16;
 const MAX_STATE_BYTES = 200 * 1024;
+
 const rooms = new Map();
 
 function makeCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code;
+
   do {
     code = Array.from({ length: 6 }, () =>
       chars[Math.floor(Math.random() * chars.length)]
     ).join('');
   } while (rooms.has(code));
+
   return code;
 }
 
 function cleanName(name) {
   if (typeof name !== 'string') return 'Jogador';
-  const value = name
+
+  return name
     .replace(/[\u0000-\u001F\u007F]/g, '')
     .trim()
-    .slice(0, MAX_NAME_LENGTH);
-  return value || 'Jogador';
+    .slice(0, 16) || 'Jogador';
 }
 
-function send(ws, payload) {
+function send(ws, data) {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(payload));
+    ws.send(JSON.stringify(data));
   }
 }
 
-function broadcast(room, payload, except = null) {
+function broadcast(room, data, except = null) {
   for (const client of room.players.keys()) {
-    if (client !== except) send(client, payload);
+    if (client !== except) send(client, data);
   }
 }
 
@@ -50,7 +52,7 @@ function getPlayers(room) {
   }));
 }
 
-function roomFor(ws) {
+function getRoom(ws) {
   const room = rooms.get(ws.roomCode);
   return room && room.players.has(ws) ? room : null;
 }
@@ -59,16 +61,17 @@ function leaveRoom(ws) {
   const code = ws.roomCode;
   if (!code) return;
 
-  const room = rooms.get(code);
   ws.roomCode = null;
+
+  const room = rooms.get(code);
   if (!room) return;
 
   const player = room.players.get(ws);
   if (!player) return;
 
   room.players.delete(ws);
-  room.personalItems.delete(player.id);
   room.playerStates.delete(player.id);
+  room.personalItems.delete(player.id);
 
   if (room.players.size === 0) {
     rooms.delete(code);
@@ -100,21 +103,19 @@ function sendError(ws, message) {
 const server = http.createServer((req, res) => {
   if (req.url === '/' || req.url === '/health') {
     res.writeHead(200, {
-      'content-type': 'application/json; charset=utf-8'
+      'Content-Type': 'application/json; charset=utf-8'
     });
 
     res.end(JSON.stringify({
       ok: true,
       service: 'undead-historic-server',
-      rooms: rooms.size,
-      maxPlayers: MAX_PLAYERS
+      rooms: rooms.size
     }));
+
     return;
   }
 
-  res.writeHead(404, {
-    'content-type': 'text/plain; charset=utf-8'
-  });
+  res.writeHead(404);
   res.end('Not found');
 });
 
@@ -136,8 +137,8 @@ wss.on('connection', ws => {
 
     try {
       msg = JSON.parse(raw.toString());
-    } catch (error) {
-      sendError(ws, 'Mensagem JSON inválida.');
+    } catch {
+      sendError(ws, 'JSON inválido.');
       return;
     }
 
@@ -179,7 +180,6 @@ wss.on('connection', ws => {
         type: 'room_created',
         code,
         roomCode: code,
-        player: 1,
         playerId: player.id,
         hostId: room.hostId,
         isHost: true,
@@ -192,9 +192,9 @@ wss.on('connection', ws => {
 
     // ENTRAR EM SALA
     if (msg.type === 'join_room' || msg.type === 'join') {
-      const code = String(
-        msg.code || msg.roomCode || ''
-      ).trim().toUpperCase();
+      const code = String(msg.code || msg.roomCode || '')
+        .trim()
+        .toUpperCase();
 
       const room = rooms.get(code);
 
@@ -204,23 +204,16 @@ wss.on('connection', ws => {
       }
 
       if (room.started) {
-        sendError(ws, 'A partida desta sala já começou.');
+        sendError(ws, 'A partida já começou.');
         return;
       }
 
       if (room.players.size >= MAX_PLAYERS) {
-        sendError(ws, 'Sala cheia! Máximo de 4 jogadores.');
+        sendError(ws, 'Sala cheia.');
         return;
       }
 
-      if (ws.roomCode && ws.roomCode !== code) {
-        leaveRoom(ws);
-      }
-
-      if (ws.roomCode === code && room.players.has(ws)) {
-        sendError(ws, 'Você já está nesta sala.');
-        return;
-      }
+      if (ws.roomCode) leaveRoom(ws);
 
       const player = {
         id: crypto.randomUUID(),
@@ -235,7 +228,6 @@ wss.on('connection', ws => {
         type: 'room_joined',
         code,
         roomCode: code,
-        player: room.players.size,
         playerId: player.id,
         hostId: room.hostId,
         isHost: player.id === room.hostId,
@@ -246,8 +238,7 @@ wss.on('connection', ws => {
         playerStates: Object.fromEntries(room.playerStates)
       });
 
-      // ENVIAR ESTADOS DOS JOGADORES EXISTENTES
-      for (const [peerId, peerState] of room.playerStates) {
+      for (const [peerId, state] of room.playerStates) {
         if (peerId === player.id) continue;
 
         const peer = Array.from(room.players.values())
@@ -257,7 +248,7 @@ wss.on('connection', ws => {
           type: 'peer_state',
           playerId: peerId,
           name: peer ? peer.name : 'Jogador',
-          state: peerState
+          state
         });
       }
 
@@ -278,7 +269,7 @@ wss.on('connection', ws => {
       return;
     }
 
-    const room = roomFor(ws);
+    const room = getRoom(ws);
 
     if (!room) {
       sendError(ws, 'Você não está em uma sala.');
@@ -288,17 +279,14 @@ wss.on('connection', ws => {
     const player = room.players.get(ws);
     const isHost = player.id === room.hostId;
 
-    // INICIAR PARTIDA: SOMENTE HOST
+    // INICIAR PARTIDA
     if (msg.type === 'start_game') {
       if (!isHost) {
-        sendError(ws, 'Somente o host pode iniciar a partida.');
+        sendError(ws, 'Somente o anfitrião pode iniciar.');
         return;
       }
 
-      if (room.started) {
-        sendError(ws, 'A partida já foi iniciada.');
-        return;
-      }
+      if (room.started) return;
 
       room.started = true;
       room.startAt = Date.now() + 3000;
@@ -312,7 +300,7 @@ wss.on('connection', ws => {
       return;
     }
 
-    // ESTADO INDIVIDUAL DOS JOGADORES
+    // ESTADO INDIVIDUAL: POSIÇÃO, CAPRI, ARMAS E ARMADURAS
     if (msg.type === 'state' || msg.type === 'player_state') {
       if (
         !msg.state ||
@@ -323,7 +311,7 @@ wss.on('connection', ws => {
       const serialized = JSON.stringify(msg.state);
 
       if (Buffer.byteLength(serialized, 'utf8') > MAX_STATE_BYTES) {
-        sendError(ws, 'Estado do jogador muito grande.');
+        sendError(ws, 'Estado muito grande.');
         return;
       }
 
@@ -339,10 +327,10 @@ wss.on('connection', ws => {
       return;
     }
 
-    // ESTADO COMPARTILHADO DO MUNDO: SOMENTE HOST
+    // ESTADO DO MUNDO: SOMENTE ANFITRIÃO
     if (msg.type === 'world_state') {
       if (!isHost) {
-        sendError(ws, 'Somente o host pode sincronizar o mundo.');
+        sendError(ws, 'Somente o anfitrião pode sincronizar o mundo.');
         return;
       }
 
@@ -370,8 +358,7 @@ wss.on('connection', ws => {
       return;
     }
 
-    // EVENTOS DE CHEFES E INIMIGOS
-    // TODOS OS JOGADORES PODEM ENVIAR EVENTOS.
+    // ATAQUES, DANO E EVENTOS DOS BOSSES
     if (msg.type === 'world_event') {
       if (
         !msg.event ||
@@ -382,7 +369,7 @@ wss.on('connection', ws => {
       const serialized = JSON.stringify(msg.event);
 
       if (Buffer.byteLength(serialized, 'utf8') > 16 * 1024) {
-        sendError(ws, 'Evento do mundo muito grande.');
+        sendError(ws, 'Evento muito grande.');
         return;
       }
 
@@ -395,26 +382,21 @@ wss.on('connection', ws => {
       return;
     }
 
-    // COLETA DE ITENS
+    // COLETAR ITEM
     if (msg.type === 'claim_item') {
       const itemId = String(msg.itemId || '')
         .trim()
         .slice(0, 100);
 
-      if (!itemId) {
-        sendError(ws, 'Item inválido.');
-        return;
-      }
+      if (!itemId) return;
 
-      // CHIP DA CAPRI: ÚNICO POR SALA
       if (itemId === 'chip' || itemId === 'capri_chip') {
         if (room.chipClaimed) {
           send(ws, {
             type: 'item_claim_result',
             itemId: 'chip',
             accepted: false,
-            reason: 'already_claimed',
-            chipClaimed: true
+            reason: 'already_claimed'
           });
           return;
         }
@@ -432,14 +414,12 @@ wss.on('connection', ws => {
         send(ws, {
           type: 'item_claim_result',
           itemId: 'chip',
-          accepted: true,
-          chipClaimed: true
+          accepted: true
         });
 
         return;
       }
 
-      // ITENS COMUNS: UMA CÓPIA POR JOGADOR
       let owned = room.personalItems.get(player.id);
 
       if (!owned) {
@@ -468,7 +448,7 @@ wss.on('connection', ws => {
       return;
     }
 
-    // SOLICITAR ESTADO ATUAL DO MUNDO
+    // SOLICITAR ESTADO DO MUNDO
     if (msg.type === 'get_world_state') {
       send(ws, {
         type: 'world_state',
